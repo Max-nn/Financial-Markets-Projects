@@ -1,0 +1,711 @@
+import streamlit as st
+import pandas as pd
+import numpy as np
+import datetime
+import pdblp  # Your Bloomberg connector
+import blpapi # For the Heston override
+import scipy.stats as si
+from scipy.interpolate import interp1d
+from scipy.optimize import minimize
+import QuantLib as ql
+import io      # For in-memory Excel file
+from urllib.parse import quote # For email link
+
+# --- Helper Function for Excel Export ---
+@st.cache_data # Cache the conversion to speed up downloads
+def to_excel_in_memory(df):
+    """
+    Writes a DataFrame to an in-memory Excel file and returns the bytes.
+    """
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        df.to_excel(writer, index=True, sheet_name='RiskMonitor')
+    # Get the bytes from the buffer
+    data = output.getvalue()
+    return data
+
+
+# --- 1. YOUR ENTIRE ANALYSIS SCRIPT (WRAPPED IN A FUNCTION) ---
+@st.cache_data(ttl="15m") # Cache the data for 15 minutes
+def run_risk_analysis():
+    """
+    This function contains your entire working Python script.
+    It connects to Bloomberg, calculates all Greeks, and returns
+    the final DataFrame.
+    """
+    # --- 1. Load Data and Connect to Bloomberg ---
+    # Import deals data using pd.read
+    deals_data = pd.read_excel('ProjetBBG.xlsx')
+
+    # We create the risk dataframe
+    risk_monitor = deals_data.copy()
+
+    # We initiate connexion with BBG
+    con = pdblp.BCon(port=8194, timeout=10000)
+    con.start()
+
+    # --- 2. Get Market Data for Options & Underlyings ---
+    # Define tickers and fields to find
+    tickers = risk_monitor['Ticker']
+
+    # Fields
+    # --- 2a. Get Option Data (using blpapi for overrides) ---
+    option_tickers = risk_monitor['Ticker']
+    option_tickers_list = (option_tickers.astype(str) + ' Equity').tolist()
+
+    # We now need to make two separate requests because of the override.
+
+    # --- Request 1: Standard Data (Bid, Ask, Last, BSM Vol) ---
+    print("Fetching standard option data...")
+    std_fields = ['BID', 'ASK', 'PX_LAST', 'OPT_IMPLIED_VOLATILITY_MID']
+    # This returns a LONG DataFrame (76 rows) with a MultiIndex
+    std_data_long = con.ref(option_tickers_list, std_fields)
+    std_data = std_data_long.pivot(
+        index='ticker',
+        columns='field',
+        values='value'
+    )
+    print(std_data)
+    # Now, std_data_wide.index is the tickers WITH ' Equity'
+    # We replace this index with risk_monitor's (without ' Equity')
+    # to ensure the assignment works.
+    std_data.index = risk_monitor.index
+    # Assign the standard data
+    risk_monitor['Opt_Bid'] = std_data['BID']
+    risk_monitor['Opt_Ask'] = std_data['ASK']
+    risk_monitor['Opt_Last'] = std_data['PX_LAST']
+    risk_monitor['IV'] = std_data['OPT_IMPLIED_VOLATILITY_MID'] / 100.0  # Convert to decimal
+
+    # --- Request 2: Normal Volatility (Bachelier) using blpapi ---
+    print("Fetching Normal (Bachelier) volatility...")
+
+    # Get the underlying blpapi session from pdblp
+    session = con._session
+
+    # 1. Create the Request
+    refDataService = session.getService("//blp/refdata")
+    request = refDataService.createRequest("ReferenceDataRequest")
+
+    # 2. Add Securities
+    for ticker in option_tickers_list:
+        request.append("securities", ticker)
+
+    # 3. Add the Field we want
+    request.append("fields", "OPT_IMPLIED_VOLATILITY_MID")
+
+    # 4. CRITICAL: Add the Override
+    overrides = request.getElement("overrides")
+    override = overrides.appendElement()
+    override.setElement("fieldId", "VOLATILITY_TYPE")
+    override.setElement("value", "NORMAL")  # Tell Bloomberg to use Bachelier model
+
+    # 5. Send the Request
+    session.sendRequest(request)
+
+    # 6. Process the Response
+    normal_vol_data = {}
+    while True:
+        ev = session.nextEvent(con.timeout)
+        for msg in ev:
+            if msg.hasElement("securityData"):
+                securityData = msg.getElement("securityData")
+                for sec in securityData.values():
+                    ticker = sec.getElementAsString("security")
+                    # Find the original ticker from the list to match the index
+                    original_ticker = [t for t in option_tickers if ticker.startswith(t)][0]
+
+                    if sec.hasElement("fieldData"):
+                        fieldData = sec.getElement("fieldData")
+                        if fieldData.hasElement("OPT_IMPLIED_VOLATILITY_MID"):
+                            # This value is the NORMAL vol (in BPS) because of our override
+                            normal_vol = fieldData.getElementAsFloat("OPT_IMPLIED_VOLATILITY_MID")
+                            normal_vol_data[original_ticker] = normal_vol
+        if ev.eventType() == blp.Event.RESPONSE:
+            break  # Exit loop when data is fully received
+
+    # 7. Assign the data to the DataFrame
+    # Map the results dict back to the DataFrame index
+    risk_monitor['IV_Normal'] = risk_monitor.index.map(normal_vol_data) / 10000.0  # Convert BPS to decimal
+
+    print("All option data fetched successfully.")
+
+    # Get key inputs for BSM calculations
+    # Timing
+    today = datetime.date.today()
+    # TIME TO MATURITY T
+    exp_date = pd.to_datetime(risk_monitor['Maturity'])
+    risk_monitor['Maturity'] = pd.to_datetime(risk_monitor['Maturity']).dt.date
+    today_ts = pd.to_datetime(today)
+    trading_days_delta = (exp_date - today_ts)  # calculates nb of trading day between today and exp
+    risk_monitor['TradingDaysToMat'] = trading_days_delta.dt.days
+    days_to_mat = (risk_monitor['Maturity'] - today).apply(lambda x: x.days if pd.notna(x) else np.nan)
+    T = days_to_mat / 365.25  # Use 365.25 for leap years
+    risk_monitor['T'] = T
+
+    # We import historical price data with BBG
+    company_tickers = deals_data['Ticker'].str.split(' ').str[
+                          0] + ' Equity'  # We keep only the ticker part of the column
+    risk_monitor['S_Ticker'] = company_tickers
+    company_fields = ['PX_LAST', 'DIVIDEND_YIELD']
+    # Create a temporary dataframe for underlying data
+    underlying_data = con.ref(company_tickers.unique().tolist(), company_fields)
+    underlying_data = underlying_data.pivot(
+        index='ticker',
+        columns='field',
+        values='value'
+    )
+    # Now we can create the maps from this wide DataFrame
+    s0_map = underlying_data['PX_LAST'].to_dict()
+    q_map = (underlying_data['DIVIDEND_YIELD'] / 100.0).to_dict()  # Convert yield to decimal
+
+    # --- ADD THESE 3 LINES ---
+    # This maps the dictionaries back to the main DataFrame
+    risk_monitor['S'] = company_tickers.map(s0_map)
+    risk_monitor['q'] = company_tickers.map(q_map)
+    risk_monitor['q'] = risk_monitor['q'].fillna(0)  # Assume 0 dividend if BBG returns NaN
+    # -------------------------
+    # --- 4. TASK 2: Compute the Yield Curve using US Govies (r) ---
+
+    print("---Fetching US Treasury yield curve---")
+    # Define the tickers for the US Treasury "Actives" curve
+    # We get key points on the curve to build our interpolation
+    curve_tickers = {
+        'US0001M Index': 1 / 12.0,  # 1 Month
+        'US0003M Index': 3 / 12.0,  # 3 Month
+        'US0006M Index': 6 / 12.0,  # 6 Month
+        'US0012M Index': 1.0,  # 1 Year
+        'USGG2YR Index': 2.0,  # 2 Year
+        'USGG5YR Index': 5.0,  # 5 Year
+        'USGG10YR Index': 10.0,  # 10 Year
+    }
+
+    # Fetch the last price (which is the yield) for these tickers
+    curve_data = con.ref(list(curve_tickers.keys()), ['PX_LAST'])
+    curve_data = curve_data.pivot(
+        index='ticker',
+        columns='field',
+        values='value'
+    )
+    # Create a clean list of (time, rate) points for interpolation
+    # .values.flatten() converts the DataFrame column to a simple list
+    # We sort by time to ensure the interpolation works
+    curve_points_T = sorted(curve_tickers.values())
+    curve_points_r = (curve_data['PX_LAST'] / 100.0).sort_index().values  # Convert to decimal
+
+    # Create an interpolation function
+    # 'interp1d' builds a function that can find any 'y' (rate) for a given 'x' (time)
+    # 'fill_value="extrapolate"' allows us to get rates for maturities outside our 1M-10Y range
+    yield_curve_func = interp1d(
+        curve_points_T,
+        curve_points_r,
+        kind='linear',  # 'linear' interpolation is standard
+        fill_value="extrapolate"
+    )
+
+    # Now, apply this function to our 'T' (time to maturity) column to get the risk-free rate
+    risk_monitor['r'] = risk_monitor['T'].apply(yield_curve_func)
+    r = risk_monitor['r']
+
+    # --- 5. TASK 1: Compute the Greeks (BSM Functions) ---
+
+    print("--Calculating Greeks--")
+
+    def d1(S, K, T, r, q, sigma):
+        """Calculates d1 for the BSM model"""
+        return (np.log(S / K) + (r - q + 0.5 * sigma ** 2) * T) / (sigma * np.sqrt(T))
+
+    def d2(S, K, T, r, q, sigma):
+        """Calculates d2 for the BSM model"""
+        return d1(S, K, T, r, q, sigma) - sigma * np.sqrt(T)
+
+    # --- NEW VECTORIZED FUNCTION ---
+    def bsm_delta(S, K, T, r, q, sigma, option_type):
+        """Calculates Delta of an option"""
+        d1_val = d1(S, K, T, r, q, sigma)
+
+        # Use np.where for if/else logic on a vector
+        # np.where(condition, value_if_true, value_if_false)
+        condition = (option_type == 'C')  # Check for 'C'
+
+        call_delta = np.exp(-q * T) * si.norm.cdf(d1_val)
+        put_delta = -np.exp(-q * T) * si.norm.cdf(-d1_val)
+
+        return np.where(condition, call_delta, put_delta)
+
+    def bsm_gamma(S, K, T, r, q, sigma):
+        """Calculates Gamma of an option (type-independent)"""
+        d1_val = d1(S, K, T, r, q, sigma)
+        pdf_d1 = si.norm.pdf(d1_val)
+        return (np.exp(-q * T) * pdf_d1) / (S * sigma * np.sqrt(T))
+
+    def bsm_vega(S, K, T, r, q, sigma):
+        """Calculates Vega of an option (type-independent)"""
+        d1_val = d1(S, K, T, r, q, sigma)
+        pdf_d1 = si.norm.pdf(d1_val)
+        # This is Vega per 1.0 vol change, divide by 100 for Vega per 1% change
+        return (S * np.exp(-q * T) * pdf_d1 * np.sqrt(T)) / 100.0
+
+    # --- NEW VECTORIZED FUNCTION ---
+    def bsm_theta(S, K, T, r, q, sigma, option_type):
+        """Calculates Theta of an option (per calendar day)"""
+        d1_val = d1(S, K, T, r, q, sigma)
+        d2_val = d2(S, K, T, r, q, sigma)
+        pdf_d1 = si.norm.pdf(d1_val)
+
+        common_term = (- (S * np.exp(-q * T) * pdf_d1 * sigma) / (2 * np.sqrt(T)))
+
+        call_theta = (common_term
+                      - r * K * np.exp(-r * T) * si.norm.cdf(d2_val)
+                      + q * S * np.exp(-q * T) * si.norm.cdf(d1_val))
+
+        put_theta = (common_term
+                     + r * K * np.exp(-r * T) * si.norm.cdf(-d2_val)
+                     - q * S * np.exp(-q * T) * si.norm.cdf(-d1_val))
+
+        condition = (option_type == 'C')  # Check for 'C'
+
+        theta = np.where(condition, call_theta, put_theta)
+
+        # Return Theta per day (divide by 365.25)
+        return theta / 365.25
+
+    # --- NEW VECTORIZED FUNCTION ---
+    def bsm_rho(S, K, T, r, q, sigma, option_type):
+        """Calculates Rho of an option (per 1% rate change)"""
+        d2_val = d2(S, K, T, r, q, sigma)
+
+        call_rho = K * T * np.exp(-r * T) * si.norm.cdf(d2_val)
+        put_rho = -K * T * np.exp(-r * T) * si.norm.cdf(-d2_val)
+
+        condition = (option_type == 'C')  # Check for 'C'
+
+        rho = np.where(condition, call_rho, put_rho)
+
+        # Return Rho per 1% change (divide by 100)
+        return rho / 100.0
+
+    # --- 6. Apply Greeks Functions to the DataFrame ---
+
+    # We can't use .apply() easily because we have multiple columns.
+    # vectorization is faster than looping
+    S_vec = risk_monitor['S']
+    K_vec = risk_monitor['Strike Px']
+    T_vec = risk_monitor['T']
+    r_vec = risk_monitor['r']
+    q_vec = risk_monitor['q']
+    sigma_vec = risk_monitor['IV']
+    type_vec = risk_monitor['Type']
+
+    risk_monitor['Delta'] = bsm_delta(S_vec, K_vec, T_vec, r_vec, q_vec, sigma_vec, type_vec)
+    risk_monitor['Gamma'] = bsm_gamma(S_vec, K_vec, T_vec, r_vec, q_vec, sigma_vec)
+    risk_monitor['Vega'] = bsm_vega(S_vec, K_vec, T_vec, r_vec, q_vec, sigma_vec)
+    risk_monitor['Theta'] = bsm_theta(S_vec, K_vec, T_vec, r_vec, q_vec, sigma_vec, type_vec)
+    risk_monitor['Rho'] = bsm_rho(S_vec, K_vec, T_vec, r_vec, q_vec, sigma_vec, type_vec)
+    # --- 6c. NEW: Calculate Intrinsic Value ---
+    print("Calculating Intrinsic Value...")
+
+    # Calculate Call and Put intrinsic values
+    call_intrinsic = S_vec - K_vec
+    put_intrinsic = K_vec - S_vec
+
+    # Use np.where to choose based on option type
+    intrinsic_value = np.where(type_vec == 'C', call_intrinsic, put_intrinsic)
+
+    # Apply the max(0, ...) and assign to new column
+    risk_monitor['Intrinsic_Value'] = np.maximum(0, intrinsic_value)
+    # --- 7. Bachelier Model ---
+    print("--Calculating Bachelier (Normal Model) Greeks--")
+
+    def bachelier_d(S, K, T, r, q, sigma_norm):
+        """Calculates 'd' for the Bachelier/Normal model"""
+        F = S * np.exp((r - q) * T)
+        numer = F - K
+        # sigma_abs * sqrt(T)
+        denom = sigma_norm * S * np.sqrt(T)
+
+        # We must handle T=0 (or T is very small)
+        tiny = 1e-8
+
+        # Where denom is NOT zero, calculate normally
+        # We set the 'out' array to 0.0 to handle the 0/0 (ATM) case
+        d_val = np.divide(numer, denom, out=np.full_like(numer, 0.0), where=(denom > tiny))
+
+        # Where denom IS zero (T=0) and F != K (ITM/OTM), set to +/- infinity
+        d_val = np.where((denom <= tiny) & (numer > 0), np.inf, d_val)
+        d_val = np.where((denom <= tiny) & (numer < 0), -np.inf, d_val)
+
+        return d_val
+
+    # --- CORRECTED FORMULA ---
+    def bachelier_delta(S, K, T, r, q, sigma_norm, option_type):
+        """Calculates Delta for the Bachelier/Normal model"""
+        d_val = bachelier_d(S, K, T, r, q, sigma_norm)
+
+        # d_val will be inf, -inf, or 0 (at-the-money) when T=0
+        # si.norm.cdf(inf) = 1.0, cdf(-inf) = 0.0, cdf(0) = 0.5
+
+        call_delta_fwd = si.norm.cdf(d_val)
+        put_delta_fwd = -si.norm.cdf(-d_val)  # which is si.norm.cdf(d_val) - 1
+
+        condition = (option_type == 'C')
+        delta_fwd = np.where(condition, call_delta_fwd, put_delta_fwd)
+
+        # Convert Delta (w.r.t Forward) to Delta (w.r.t Spot)
+        # Delta_Spot = Delta_Fwd * dF/dS = Delta_Fwd * exp((r-q)T)
+        # The previous extra term was incorrect and caused the NaN.
+        return np.exp((r - q) * T) * delta_fwd
+
+    # --- CORRECTED FORMULA & T=0 HANDLING ---
+    def bachelier_gamma(S, K, T, r, q, sigma_norm):
+        """Calculates Gamma for the Bachelier/Normal model"""
+        d_val = bachelier_d(S, K, T, r, q, sigma_norm)
+        pdf_d = si.norm.pdf(d_val)  # pdf(inf) = 0, pdf(0) = 0.3989
+
+        denom = sigma_norm * S * np.sqrt(T)
+        tiny = 1e-8
+
+        # Correct gamma formula = (d^2V/dF^2) * (dF/dS)^2
+        numer = np.exp(2 * (r - q) * T) * pdf_d
+
+        # Use np.divide to handle 0/0 (T=0, ITM/OTM) -> 0.0
+        gamma_val = np.divide(numer, denom, out=np.full_like(numer, 0.0), where=(denom > tiny))
+
+        # At T=0, ATM, d=0, pdf=0.3989, denom=0. Result is inf.
+        # For risk, we set this to 0 (or a large number), 0 is safer.
+        return np.where(denom <= tiny, 0.0, gamma_val)
+
+    # --- Apply Bachelier Greeks ---
+    bachelier_greeks_df = risk_monitor[['Ticker', 'Last Price', 'Strike Px', 'Opt_Bid', 'Opt_Ask', 'Opt_Last']].copy()
+    sigma_norm_vec = risk_monitor['IV_Normal']
+    bachelier_greeks_df['Delta_Bach'] = bachelier_delta(S_vec, K_vec, T_vec, r_vec, q_vec, sigma_norm_vec, type_vec)
+    bachelier_greeks_df['Gamma_Bach'] = bachelier_gamma(S_vec, K_vec, T_vec, r_vec, q_vec, sigma_norm_vec)
+    print(bachelier_greeks_df)
+
+    # --- 4.5 NEW: Prepare Data for Heston Calibration ---
+    print("\n--- Preparing Data for Calibration ---")
+
+    # Calculate mid-price to calibrate against
+    risk_monitor['Market_Price'] = (risk_monitor['Opt_Bid'] + risk_monitor['Opt_Ask']) / 2.0
+
+    # Filter out bad data. We need valid bid/ask and a positive market price.
+    calibration_data = risk_monitor[
+        (risk_monitor['Opt_Bid'] > 0) &
+        (risk_monitor['Opt_Ask'] > 0) &
+        (risk_monitor['Market_Price'] > 0.01)  # Avoid zero-priced options
+        ].copy()
+    ql_today = ql.Date(today.day, today.month, today.year)
+    ql.Settings.instance().evaluationDate = ql_today
+
+    # --- 7. ### NEW: Heston Model CALIBRATION ---
+    print("\n--- Starting Heston Calibration ---")
+    # We must calibrate parameters PER UNDERLYING.
+    # This dict will store the calibrated params for each stock
+    calibrated_params_map = {}
+    underlying_tickers = risk_monitor['S_Ticker'].unique()
+
+    for ticker in underlying_tickers:
+        print(f"\nCalibrating for: {ticker}")
+
+        # 1. Get the data for this underlying
+        options_for_ticker = calibration_data[
+            calibration_data['S_Ticker'] == ticker
+            ].copy()
+
+        if len(options_for_ticker) < 2:  # Need a minimum number of options
+            print(f"Skipping {ticker}, not enough data points ({len(options_for_ticker)})")
+            calibrated_params_map[ticker] = None  # Mark as failed
+            continue
+
+        # --- 2. Define the Objective (Loss) Function ---
+        # This function will be minimized by SciPy
+        def heston_calibration_loss(params):
+            """
+            Takes Heston params [v0, kappa, theta, sigma_v, rho]
+            and returns the RMSE between model prices and market prices.
+            """
+            v0, kappa, theta, sigma_v, rho = params
+            model_prices = []
+
+            try:
+                # We loop over our pre-filtered options for this ticker
+                for _, row in options_for_ticker.iterrows():
+                    # 1. Set up QL objects for this option
+                    ql_expiry = ql.Date(row['Maturity'].day, row['Maturity'].month, row['Maturity'].year)
+                    payoff = ql.PlainVanillaPayoff(ql.Option.Call if row['Type'] == 'C' else ql.Option.Put,
+                                                   row['Strike Px'])
+                    exercise = ql.EuropeanExercise(ql_expiry)
+                    option = ql.VanillaOption(payoff, exercise)
+
+                    # 2. Set up market data handles
+                    spot_handle_opt = ql.QuoteHandle(ql.SimpleQuote(row['S']))
+                    rate_handle_opt = ql.YieldTermStructureHandle(
+                        ql.FlatForward(ql_today, row['r'], ql.Actual365Fixed()))
+                    div_handle_opt = ql.YieldTermStructureHandle(
+                        ql.FlatForward(ql_today, row['q'], ql.Actual365Fixed()))
+
+                    # 3. Set up Heston Model *with the test parameters*
+                    heston_process = ql.HestonProcess(rate_handle_opt, div_handle_opt, spot_handle_opt, v0, kappa,
+                                                      theta,
+                                                      sigma_v, rho)
+                    heston_model = ql.HestonModel(heston_process)
+                    engine = ql.AnalyticHestonEngine(heston_model)
+                    option.setPricingEngine(engine)
+
+                    model_prices.append(option.NPV())
+
+            except Exception as e:
+                # Optimizer supplied bad parameters (e.g. Feller condition violation)
+                # print(f"Warning: QL Error with params {params}: {e}") # Uncomment for debug
+                return 1e9  # Return a huge error to penalize this
+
+            # 4. Calculate error (RMSE)
+            model_prices = np.array(model_prices)
+            market_prices_np = options_for_ticker['Market_Price'].values
+
+            # Check for NaN/Inf in model prices, which can happen with bad params
+            if not np.all(np.isfinite(model_prices)):
+                return 1e9  # Penalize
+
+            error = np.sqrt(np.mean((model_prices - market_prices_np) ** 2))
+
+            # print(f"Trying params: {params}, Error: {error}") # Uncomment for debug
+            return error
+
+        # --- 3. Run the Optimization ---
+        # Initial guesses (your placeholder values)
+        initial_params = [0.06, 0.1, 0.05, 0.1, -0.7]  # v0, kappa, theta, sigma_v, rho
+
+        # Bounds for the parameters (v0, kappa, theta, sigma_v, rho)
+        # These are critical for a stable optimization
+        bounds = [
+            (1e-5, 1.0),  # v0 (initial variance)
+            (1e-3, 20.0),  # kappa (mean reversion speed)
+            (1e-5, 1.0),  # theta (long-run variance)
+            (1e-3, 2.0),  # sigma_v (vol of vol)
+            (-0.99, 0.99)  # rho (correlation)
+        ]
+
+        print(f"Starting optimization for {ticker} with {len(options_for_ticker)} options...")
+
+        # Use 'L-BFGS-B' as it's fast and handles bounds
+        result = minimize(
+            heston_calibration_loss,
+            initial_params,
+            method='L-BFGS-B',
+            bounds=bounds,
+            options={'maxiter': 200, 'ftol': 1e-7}  # 'ftol' is function tolerance
+        )
+
+        if result.success:
+            calibrated_params = result.x
+            print(f"--- Calibration SUCCESS for {ticker} ---")
+            print(f"  v0 (Initial Var)  = {calibrated_params[0]:.6f}")
+            print(f"  kappa (Reversion) = {calibrated_params[1]:.6f}")
+            print(f"  theta (Long Var)  = {calibrated_params[2]:.6f}")
+            print(f"  sigma_v (VolofVol) = {calibrated_params[3]:.6f}")
+            print(f"  rho (Correlation) = {calibrated_params[4]:.6f}")
+            print(f"  Final RMSE (price error): {result.fun:.6f}")
+
+            # Store them in our map
+            calibrated_params_map[ticker] = {
+                'v0': calibrated_params[0],
+                'kappa': calibrated_params[1],
+                'theta': calibrated_params[2],
+                'sigma_v': calibrated_params[3],
+                'rho': calibrated_params[4]
+            }
+        else:
+            print(f"--- Calibration FAILED for {ticker} ---")
+            print(f"  Message: {result.message}")
+            calibrated_params_map[ticker] = None  # Mark as failed
+
+    # --- END OF CALIBRATION LOOP ---
+
+    # --- 8. ### MODIFIED: Heston Model (via QuantLib) ---
+    print("\n--Calculating Heston Greeks (using CALIBRATED params)--")
+
+    # -- Heston Parameters --
+    # ### MODIFIED: We delete the hard-coded values.
+    # v0 = 0.06  ...etc...
+
+    def calculate_heston_greeks(row):
+        """
+        ### MODIFIED:
+        This function now looks up the calibrated parameters
+        for the specific underlying of the option row.
+        """
+
+        # --- 0. Get the calibrated params for this row's underlying ---
+        underlying_ticker = row['S_Ticker']
+        params = calibrated_params_map.get(underlying_ticker)
+
+        if params is None:
+            # Calibration failed or was skipped for this ticker
+            return pd.Series(dtype='float64')  # Return NaNs
+
+        # Unpack the params
+        v0 = params['v0']
+        kappa = params['kappa']
+        theta = params['theta']
+        sigma_v = params['sigma_v']
+        rho = params['rho']
+
+        # 1. Set up QuantLib objects for this option
+        # ql_today is already set globally
+        ql_expiry = ql.Date(row['Maturity'].day, row['Maturity'].month, row['Maturity'].year)
+
+        payoff = ql.PlainVanillaPayoff(
+            ql.Option.Call if row['Type'] == 'C' else ql.Option.Put,
+            row['Strike Px']
+        )
+        exercise = ql.EuropeanExercise(ql_expiry)
+        option = ql.VanillaOption(payoff, exercise)
+
+        # 2. Set up market data handles
+        spot_handle = ql.QuoteHandle(ql.SimpleQuote(row['S']))
+        rate_handle = ql.YieldTermStructureHandle(ql.FlatForward(ql_today, row['r'], ql.Actual365Fixed()))
+        div_handle = ql.YieldTermStructureHandle(ql.FlatForward(ql_today, row['q'], ql.Actual365Fixed()))
+
+        # 3. Set up Heston Model
+        heston_process = ql.HestonProcess(rate_handle, div_handle, spot_handle, v0, kappa, theta, sigma_v, rho)
+        heston_model = ql.HestonModel(heston_process)
+
+        # Use a high-quality pricing engine
+        engine = ql.AnalyticHestonEngine(heston_model)
+        option.setPricingEngine(engine)
+
+        # 4. Calculate and return Greeks
+        try:
+            return pd.Series({
+                'Delta_Heston': option.delta(),
+                'Gamma_Heston': option.gamma(),
+                'Vega_Heston': option.vega() / 100.0,  # Per 1% vol change
+                'Theta_Heston': option.theta() / 365.25  # Per day
+            })
+        except Exception as e:
+            print(f"QuantLib Error for {row.name} (Ticker: {underlying_ticker}): {e}")
+            return pd.Series(dtype='float64')
+
+    # Apply the Heston function to each row
+    heston_greeks_df = risk_monitor.apply(calculate_heston_greeks, axis=1)
+
+    # Merge the results back into the main DataFrame
+    risk_monitor = pd.concat([risk_monitor, heston_greeks_df], axis=1)
+
+    # --- Final Output ---
+    print("\n--- Risk Monitor with Greeks ---")
+    # ### MODIFIED: Add Heston greeks to the final output
+    final_columns = [
+        'S_Ticker', 'Type', 'S', 'Strike Px', 'Maturity', 'Opt_Bid', 'Opt_Ask', 'Opt_Last', 'IV',
+        'Delta', 'Gamma', 'Vega', 'Theta', 'Rho',
+        'Delta_Heston', 'Gamma_Heston', 'Vega_Heston', 'Theta_Heston', 'Intrinsic_Value'
+    ]
+    # Filter for columns that actually exist, in case some failed
+    final_columns_exist = [col for col in final_columns if col in risk_monitor.columns]
+    print(risk_monitor[final_columns_exist].to_string(float_format="%.4f"))
+    print(bachelier_greeks_df)
+
+    # Optional: Save to Excel
+    # risk_monitor.to_excel("Risk_Monitor_with_Greeks.xlsx")
+
+    print("\nScript completed.")
+
+    # Stop the Bloomberg connection
+    con.stop()
+
+
+# --- 2. BUILD THE STREAMLIT USER INTERFACE ---
+
+# Set the page to wide mode for a better table view
+st.set_page_config(layout="wide")
+
+st.title("📈 Option Risk Monitor")
+
+# --- Run the analysis ---
+# This will show a spinner while the function runs for the first time
+with st.spinner("Connecting to Bloomberg and calculating Greeks..."):
+    risk_monitor_df, final_columns = run_risk_analysis()
+
+# Check if the analysis was successful
+if risk_monitor_df is not None:
+
+    # Get the final DataFrame to display
+    display_df = risk_monitor_df[final_columns].copy()
+
+    # --- Create two columns for the buttons ---
+    col1, col2 = st.columns(2)
+
+    # --- MANDATORY 1: Export to Excel Button ---
+    with col1:
+        excel_bytes = to_excel_in_memory(display_df)
+        st.download_button(
+            label="⬇️ Download Data as Excel",
+            data=excel_bytes,
+            file_name=f"Risk_Monitor_{datetime.date.today()}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True
+        )
+
+    # --- MANDATORY 2: Send by Email ---
+    # Note: Sending an email *directly* requires an SMTP server, user,
+    # and password, which is a major security risk and complex.
+    # The *best* method is to generate a 'mailto:' link that opens
+    # the user's default email client (like Outlook).
+
+    with col2:
+        # Create a form to get the email address
+        with st.form("email_form"):
+            recipient_email = st.text_input("Recipient Email Address")
+            submit_button = st.form_submit_button(
+                label="📧 Generate Email (in Outlook/Gmail)",
+                use_container_width=True
+            )
+
+            if submit_button and recipient_email:
+                # Create the email content
+                subject = quote(f"Option Risk Report - {datetime.date.today()}")
+                body = quote(
+                    "Please find the latest option risk report attached.\n\n"
+                    "(Note: Please download the file using the 'Download Data' button and attach it to this email.)"
+                )
+
+                # Create the mailto link
+                mailto_link = f"mailto:{recipient_email}?subject={subject}&body={body}"
+
+                # Display instructions
+                st.info("Please follow these steps:", icon="ℹ️")
+                st.markdown(
+                    "1.  **Download the file** using the 'Download Data as Excel' button.\n"
+                    f"2. **[Click here to open your email client]({mailto_link})**.\n"
+                    "3.  **Manually attach** the downloaded Excel file to the email."
+                )
+
+    # --- Display the "Appealing" Data Table ---
+    st.markdown("---")
+    st.header("Risk Monitor Results")
+    st.dataframe(
+        display_df.style.format(
+            {
+                'Strike Px': '{:,.2f}',
+                'Opt_Last': '{:,.2f}',
+                'S': '{:,.2f}',
+                'T': '{:,.4f}',
+                'r': '{:,.4%}',
+                'IV': '{:,.2%}',
+                'IV_Normal': '{:,.2%}',
+                'q': '{:,.4%}',
+                'Intrinsic_Value': '{:,.2f}',
+                'Delta_BSM': '{:,.4f}',
+                'Gamma_BSM': '{:,.4f}',
+                'Vega_BSM': '{:,.4f}',
+                'Theta_BSM': '{:,.4f}',
+                'Rho_BSM': '{:,.4f}',
+                'Delta_Bach': '{:,.4f}',
+                'Gamma_Bach': '{:,.4f}',
+                'Delta_Heston': '{:,.4f}',
+                'Gamma_Heston': '{:,.4f}',
+                'Vega_Heston': '{:,.4f}',
+                'Theta_Heston': '{:,.4f}'
+            }
+        )
+    )
