@@ -1,0 +1,558 @@
+# --- 1. IMPORTS ---
+import dash
+from dash import dcc, html, Input, Output, State, dash_table
+import pandas as pd
+import datetime
+import numpy as np
+import scipy.stats as si
+from scipy.optimize import minimize
+from scipy.interpolate import interp1d
+import blpapi as blp
+import pdblp
+import QuantLib as ql
+import os
+
+# Email Imports
+import smtplib
+from email.mime.application import MIMEApplication
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+
+# --- 2. EMAIL SENDING FUNCTION ---
+# (Configure your SMTP settings here)
+SMTP_SERVER = 'smtp.gmail.com'
+SMTP_PORT = 587
+SENDER_EMAIL = 'your_email@gmail.com'  # Replace with your email
+SENDER_PASSWORD = 'your_password'  # Replace with your app password
+
+
+def send_email(to_address, subject, body, attachment_path):
+    """
+    Sends an email with an attachment.
+    """
+    if 'your_email' in SENDER_EMAIL:
+        raise ValueError("Please configure your SMTP credentials (SENDER_EMAIL) at the top of the script.")
+
+    msg = MIMEMultipart()
+    msg['From'] = SENDER_EMAIL
+    msg['To'] = to_address
+    msg['Subject'] = subject
+    msg.attach(MIMEText(body, 'plain'))
+
+    try:
+        with open(attachment_path, 'rb') as f:
+            part = MIMEApplication(f.read(), Name=os.path.basename(attachment_path))
+        part['Content-Disposition'] = f'attachment; filename="{os.path.basename(attachment_path)}"'
+        msg.attach(part)
+    except Exception as e:
+        raise IOError(f"Error reading file {attachment_path}: {e}")
+
+    try:
+        with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
+            server.starttls()
+            server.login(SENDER_EMAIL, SENDER_PASSWORD)
+            server.send_message(msg)
+    except Exception as e:
+        raise ConnectionError(f"SMTP Connection Error: {e}")
+
+
+# --- 3. MAIN MONITOR FUNCTION ---
+def run_risk_monitor():
+    """
+    Executes the entire risk analysis script:
+    - Fetches Bloomberg Data (Options, Underlying, Yield Curve)
+    - Calculates BSM Greeks
+    - Calculates Bachelier (Normal) Greeks
+    - Calibrates Heston Model
+    - Calculates Heston Greeks via QuantLib
+    - Exports to Excel
+    """
+
+    # --- 1. Load Data and Connect to Bloomberg ---
+    print("--- 1. Loading Data and BBG Connection ---")
+    try:
+        deals_data = pd.read_excel('ProjetBBG.xlsx')
+    except FileNotFoundError:
+        print("ERROR: File 'ProjetBBG.xlsx' not found.")
+        return None, None
+
+    risk_monitor = deals_data.copy()
+
+    # Initiate connection with BBG
+    try:
+        con = pdblp.BCon(port=8194, timeout=10000)
+        con.start()
+    except Exception as e:
+        print(f"ERROR: Unable to connect to Bloomberg (port 8194). {e}")
+        return None, None
+
+    # --- 2. Get Market Data for Options & Underlyings ---
+    print("Fetching standard option data...")
+    option_tickers = risk_monitor['Ticker']
+    option_tickers_list = (option_tickers.astype(str) + ' Equity').tolist()
+
+    # Request 1: Standard Data (Bid, Ask, Last, BSM Vol)
+    std_fields = ['BID', 'ASK', 'PX_LAST', 'OPT_IMPLIED_VOLATILITY_MID']
+    std_data_long = con.ref(option_tickers_list, std_fields)
+    std_data = std_data_long.pivot(
+        index='ticker',
+        columns='field',
+        values='value'
+    )
+    # Align index if necessary (assuming unique tickers in input order)
+    # Better practice is to map by ticker, but assuming row alignment for now based on original code:
+    std_data = std_data.reindex(option_tickers_list)
+
+    # Map back to risk_monitor (resetting index to match)
+    risk_monitor['Opt_Bid'] = std_data['BID'].values
+    risk_monitor['Opt_Ask'] = std_data['ASK'].values
+    risk_monitor['Opt_Last'] = std_data['PX_LAST'].values
+    risk_monitor['IV'] = std_data['OPT_IMPLIED_VOLATILITY_MID'].values / 100.0
+
+    # Request 2: Normal Volatility (Bachelier) using blpapi
+    print("Fetching Normal (Bachelier) volatility...")
+    session = con._session
+    refDataService = session.getService("//blp/refdata")
+    request = refDataService.createRequest("ReferenceDataRequest")
+    for ticker in option_tickers_list:
+        request.append("securities", ticker)
+    request.append("fields", "OPT_IMPLIED_VOLATILITY_MID")
+    overrides = request.getElement("overrides")
+    override = overrides.appendElement()
+    override.setElement("fieldId", "VOLATILITY_TYPE")
+    override.setElement("value", "NORMAL")
+    session.sendRequest(request)
+
+    normal_vol_data = {}
+    while True:
+        ev = session.nextEvent(con.timeout)
+        for msg in ev:
+            if msg.hasElement("securityData"):
+                securityData = msg.getElement("securityData")
+                for sec in securityData.values():
+                    ticker = sec.getElementAsString("security")
+                    # Match back to original ticker input
+                    original_ticker = [t for t in option_tickers if ticker.startswith(t)]
+                    if original_ticker:
+                        orig_t = original_ticker[0]
+                        if sec.hasElement("fieldData"):
+                            fieldData = sec.getElement("fieldData")
+                            if fieldData.hasElement("OPT_IMPLIED_VOLATILITY_MID"):
+                                normal_vol = fieldData.getElementAsFloat("OPT_IMPLIED_VOLATILITY_MID")
+                                normal_vol_data[orig_t] = normal_vol
+        if ev.eventType() == blp.Event.RESPONSE:
+            break
+
+    risk_monitor['IV_Normal'] = risk_monitor['Ticker'].map(normal_vol_data) / 10000.0
+    print("All option data fetched successfully.")
+
+    # Get key inputs for BSM calculations
+    today = datetime.date.today()
+    exp_date = pd.to_datetime(risk_monitor['Maturity'])
+    risk_monitor['Maturity'] = pd.to_datetime(risk_monitor['Maturity']).dt.date
+    today_ts = pd.to_datetime(today)
+
+    trading_days_delta = (exp_date - today_ts)
+    risk_monitor['TradingDaysToMat'] = trading_days_delta.dt.days
+
+    days_to_mat = (pd.to_datetime(risk_monitor['Maturity']).dt.date - today).apply(
+        lambda x: x.days if pd.notna(x) else np.nan)
+    T = days_to_mat / 365.25
+    risk_monitor['T'] = T
+
+    company_tickers = deals_data['Ticker'].str.split(' ').str[0] + ' Equity'
+    risk_monitor['S_Ticker'] = company_tickers
+    company_fields = ['PX_LAST', 'DIVIDEND_YIELD']
+    underlying_data = con.ref(company_tickers.unique().tolist(), company_fields)
+    underlying_data = underlying_data.pivot(
+        index='ticker',
+        columns='field',
+        values='value'
+    )
+    s0_map = underlying_data['PX_LAST'].to_dict()
+    q_map = (underlying_data['DIVIDEND_YIELD'] / 100.0).to_dict()
+
+    risk_monitor['S'] = company_tickers.map(s0_map)
+    risk_monitor['q'] = company_tickers.map(q_map)
+    risk_monitor['q'] = risk_monitor['q'].fillna(0)
+
+    # --- 4. Compute the Yield Curve using US Govies (r) ---
+    print("--- Fetching US Treasury yield curve ---")
+    curve_tickers = {
+        'US0001M Index': 1 / 12.0, 'US0003M Index': 3 / 12.0, 'US0006M Index': 6 / 12.0,
+        'US0012M Index': 1.0, 'USGG2YR Index': 2.0, 'USGG5YR Index': 5.0,
+        'USGG10YR Index': 10.0,
+    }
+    curve_data = con.ref(list(curve_tickers.keys()), ['PX_LAST'])
+    curve_data = curve_data.pivot(index='ticker', columns='field', values='value')
+
+    curve_points_T = sorted(curve_tickers.values())
+    # Match sorted T values to their tickers to get correct rates
+    inv_curve_tickers = {v: k for k, v in curve_tickers.items()}
+    curve_points_r = [curve_data.loc[inv_curve_tickers[t], 'PX_LAST'] / 100.0 for t in curve_points_T]
+
+    yield_curve_func = interp1d(
+        curve_points_T,
+        curve_points_r,
+        kind='linear',
+        fill_value="extrapolate"
+    )
+    risk_monitor['r'] = risk_monitor['T'].apply(yield_curve_func)
+
+    # --- 5. BSM Greeks Functions ---
+    print("-- Calculating BSM Greeks --")
+
+    def d1(S, K, T, r, q, sigma):
+        return (np.log(S / K) + (r - q + 0.5 * sigma ** 2) * T) / (sigma * np.sqrt(T))
+
+    def d2(S, K, T, r, q, sigma):
+        return d1(S, K, T, r, q, sigma) - sigma * np.sqrt(T)
+
+    def bsm_delta(S, K, T, r, q, sigma, option_type):
+        d1_val = d1(S, K, T, r, q, sigma)
+        condition = (option_type == 'C')
+        call_delta = np.exp(-q * T) * si.norm.cdf(d1_val)
+        put_delta = -np.exp(-q * T) * si.norm.cdf(-d1_val)
+        return np.where(condition, call_delta, put_delta)
+
+    def bsm_gamma(S, K, T, r, q, sigma):
+        d1_val = d1(S, K, T, r, q, sigma)
+        pdf_d1 = si.norm.pdf(d1_val)
+        return (np.exp(-q * T) * pdf_d1) / (S * sigma * np.sqrt(T))
+
+    def bsm_vega(S, K, T, r, q, sigma):
+        d1_val = d1(S, K, T, r, q, sigma)
+        pdf_d1 = si.norm.pdf(d1_val)
+        return (S * np.exp(-q * T) * pdf_d1 * np.sqrt(T)) / 100.0
+
+    def bsm_theta(S, K, T, r, q, sigma, option_type):
+        d1_val = d1(S, K, T, r, q, sigma)
+        d2_val = d2(S, K, T, r, q, sigma)
+        pdf_d1 = si.norm.pdf(d1_val)
+        common_term = (- (S * np.exp(-q * T) * pdf_d1 * sigma) / (2 * np.sqrt(T)))
+        call_theta = (common_term - r * K * np.exp(-r * T) * si.norm.cdf(d2_val) + q * S * np.exp(-q * T) * si.norm.cdf(
+            d1_val))
+        put_theta = (common_term + r * K * np.exp(-r * T) * si.norm.cdf(-d2_val) - q * S * np.exp(-q * T) * si.norm.cdf(
+            -d1_val))
+        condition = (option_type == 'C')
+        theta = np.where(condition, call_theta, put_theta)
+        return theta / 365.25
+
+    def bsm_rho(S, K, T, r, q, sigma, option_type):
+        d2_val = d2(S, K, T, r, q, sigma)
+        call_rho = K * T * np.exp(-r * T) * si.norm.cdf(d2_val)
+        put_rho = -K * T * np.exp(-r * T) * si.norm.cdf(-d2_val)
+        condition = (option_type == 'C')
+        rho = np.where(condition, call_rho, put_rho)
+        return rho / 100.0
+
+    # --- 6. Apply Greeks Functions ---
+    S_vec = risk_monitor['S']
+    K_vec = risk_monitor['Strike Px']
+    T_vec = risk_monitor['T']
+    r_vec = risk_monitor['r']
+    q_vec = risk_monitor['q']
+    sigma_vec = risk_monitor['IV']
+    type_vec = risk_monitor['Type']
+
+    risk_monitor['Delta'] = bsm_delta(S_vec, K_vec, T_vec, r_vec, q_vec, sigma_vec, type_vec)
+    risk_monitor['Gamma'] = bsm_gamma(S_vec, K_vec, T_vec, r_vec, q_vec, sigma_vec)
+    risk_monitor['Vega'] = bsm_vega(S_vec, K_vec, T_vec, r_vec, q_vec, sigma_vec)
+    risk_monitor['Theta'] = bsm_theta(S_vec, K_vec, T_vec, r_vec, q_vec, sigma_vec, type_vec)
+    risk_monitor['Rho'] = bsm_rho(S_vec, K_vec, T_vec, r_vec, q_vec, sigma_vec, type_vec)
+
+    # --- 6c. Calculate Intrinsic Value ---
+    print("Calculating Intrinsic Value...")
+    call_intrinsic = S_vec - K_vec
+    put_intrinsic = K_vec - S_vec
+    intrinsic_value = np.where(type_vec == 'C', call_intrinsic, put_intrinsic)
+    risk_monitor['Intrinsic_Value'] = np.maximum(0, intrinsic_value)
+
+    # --- 7. Bachelier Model (Normal Vol) ---
+    print("-- Calculating Bachelier (Normal Model) Greeks --")
+
+    def bachelier_d(S, K, T, r, q, sigma_norm):
+        F = S * np.exp((r - q) * T)
+        numer = F - K
+        denom = sigma_norm * S * np.sqrt(T)
+        tiny = 1e-8
+        d_val = np.divide(numer, denom, out=np.full_like(numer, 0.0), where=(denom > tiny))
+        d_val = np.where((denom <= tiny) & (numer > 0), np.inf, d_val)
+        d_val = np.where((denom <= tiny) & (numer < 0), -np.inf, d_val)
+        return d_val
+
+    def bachelier_delta(S, K, T, r, q, sigma_norm, option_type):
+        d_val = bachelier_d(S, K, T, r, q, sigma_norm)
+        call_delta_fwd = si.norm.cdf(d_val)
+        put_delta_fwd = -si.norm.cdf(-d_val)
+        condition = (option_type == 'C')
+        delta_fwd = np.where(condition, call_delta_fwd, put_delta_fwd)
+        return np.exp((r - q) * T) * delta_fwd
+
+    def bachelier_gamma(S, K, T, r, q, sigma_norm):
+        d_val = bachelier_d(S, K, T, r, q, sigma_norm)
+        pdf_d = si.norm.pdf(d_val)
+        denom = sigma_norm * S * np.sqrt(T)
+        tiny = 1e-8
+        numer = np.exp(2 * (r - q) * T) * pdf_d
+        gamma_val = np.divide(numer, denom, out=np.full_like(numer, 0.0), where=(denom > tiny))
+        return np.where(denom <= tiny, 0.0, gamma_val)
+
+    # Apply Bachelier Greeks
+    sigma_norm_vec = risk_monitor['IV_Normal']
+    risk_monitor['Delta_Bach'] = bachelier_delta(S_vec, K_vec, T_vec, r_vec, q_vec, sigma_norm_vec, type_vec)
+    risk_monitor['Gamma_Bach'] = bachelier_gamma(S_vec, K_vec, T_vec, r_vec, q_vec, sigma_norm_vec)
+
+    # --- 8. Prepare Data for Heston Calibration ---
+    print("\n--- Preparing Data for Calibration ---")
+    risk_monitor['Market_Price'] = (risk_monitor['Opt_Bid'] + risk_monitor['Opt_Ask']) / 2.0
+
+    # Filter for valid calibration data
+    calibration_data = risk_monitor[
+        (risk_monitor['Opt_Bid'] > 0) &
+        (risk_monitor['Opt_Ask'] > 0) &
+        (risk_monitor['Market_Price'] > 0.01)
+        ].copy()
+
+    ql_today = ql.Date(today.day, today.month, today.year)
+    ql.Settings.instance().evaluationDate = ql_today
+
+    # --- 9. Heston Model CALIBRATION ---
+    print("\n--- Starting Heston Calibration ---")
+    calibrated_params_map = {}
+    underlying_tickers = risk_monitor['S_Ticker'].unique()
+
+    for ticker in underlying_tickers:
+        print(f"\nCalibrating for: {ticker}")
+        options_for_ticker = calibration_data[calibration_data['S_Ticker'] == ticker].copy()
+
+        if len(options_for_ticker) < 2:
+            print(f"Skipping {ticker}, not enough data points ({len(options_for_ticker)})")
+            calibrated_params_map[ticker] = None
+            continue
+
+        # Calibration Objective Function
+        def heston_calibration_loss(params):
+            v0, kappa, theta, sigma_v, rho = params
+            model_prices = []
+            try:
+                for _, row in options_for_ticker.iterrows():
+                    ql_expiry = ql.Date(row['Maturity'].day, row['Maturity'].month, row['Maturity'].year)
+                    payoff = ql.PlainVanillaPayoff(ql.Option.Call if row['Type'] == 'C' else ql.Option.Put,
+                                                   row['Strike Px'])
+                    exercise = ql.EuropeanExercise(ql_expiry)
+                    option = ql.VanillaOption(payoff, exercise)
+
+                    spot_handle_opt = ql.QuoteHandle(ql.SimpleQuote(row['S']))
+                    rate_handle_opt = ql.YieldTermStructureHandle(
+                        ql.FlatForward(ql_today, float(row['r']), ql.Actual365Fixed()))
+                    div_handle_opt = ql.YieldTermStructureHandle(
+                        ql.FlatForward(ql_today, float(row['q']), ql.Actual365Fixed()))
+
+                    heston_process = ql.HestonProcess(rate_handle_opt, div_handle_opt, spot_handle_opt, v0, kappa,
+                                                      theta, sigma_v, rho)
+                    heston_model = ql.HestonModel(heston_process)
+                    engine = ql.AnalyticHestonEngine(heston_model)
+                    option.setPricingEngine(engine)
+                    model_prices.append(option.NPV())
+            except Exception:
+                return 1e9
+
+            model_prices = np.array(model_prices)
+            market_prices_np = options_for_ticker['Market_Price'].values
+
+            if not np.all(np.isfinite(model_prices)):
+                return 1e9
+
+            # RMSE
+            error = np.sqrt(np.mean((model_prices - market_prices_np) ** 2))
+            return error
+
+        # Run Optimization
+        initial_params = [0.06, 0.1, 0.05, 0.1, -0.7]
+        bounds = [(1e-5, 1.0), (1e-3, 20.0), (1e-5, 1.0), (1e-3, 2.0), (-0.99, 0.99)]
+
+        print(f"Starting optimization for {ticker} with {len(options_for_ticker)} options...")
+        result = minimize(
+            heston_calibration_loss,
+            initial_params,
+            method='L-BFGS-B',
+            bounds=bounds,
+            options={'maxiter': 200, 'ftol': 1e-7}
+        )
+
+        if result.success:
+            calibrated_params = result.x
+            print(f"--- Calibration SUCCESS for {ticker} ---")
+            calibrated_params_map[ticker] = {
+                'v0': calibrated_params[0], 'kappa': calibrated_params[1],
+                'theta': calibrated_params[2], 'sigma_v': calibrated_params[3],
+                'rho': calibrated_params[4]
+            }
+        else:
+            print(f"--- Calibration FAILED for {ticker} ---")
+            calibrated_params_map[ticker] = None
+
+    # --- 10. Calculate Heston Greeks (using CALIBRATED params) ---
+    print("\n-- Calculating Heston Greeks --")
+
+    def calculate_heston_greeks(row):
+        underlying_ticker = row['S_Ticker']
+        params = calibrated_params_map.get(underlying_ticker)
+
+        if params is None:
+            return pd.Series(dtype='float64')
+
+        v0 = params['v0']
+        kappa = params['kappa']
+        theta = params['theta']
+        sigma_v = params['sigma_v']
+        rho = params['rho']
+
+        ql_expiry = ql.Date(row['Maturity'].day, row['Maturity'].month, row['Maturity'].year)
+        payoff = ql.PlainVanillaPayoff(ql.Option.Call if row['Type'] == 'C' else ql.Option.Put, row['Strike Px'])
+        exercise = ql.EuropeanExercise(ql_expiry)
+        option = ql.VanillaOption(payoff, exercise)
+
+        spot_handle = ql.QuoteHandle(ql.SimpleQuote(row['S']))
+        rate_handle = ql.YieldTermStructureHandle(ql.FlatForward(ql_today, float(row['r']), ql.Actual365Fixed()))
+        div_handle = ql.YieldTermStructureHandle(ql.FlatForward(ql_today, float(row['q']), ql.Actual365Fixed()))
+
+        heston_process = ql.HestonProcess(rate_handle, div_handle, spot_handle, v0, kappa, theta, sigma_v, rho)
+        heston_model = ql.HestonModel(heston_process)
+        engine = ql.AnalyticHestonEngine(heston_model)
+        option.setPricingEngine(engine)
+
+        try:
+            return pd.Series({
+                'Delta_Heston': option.delta(),
+                'Gamma_Heston': option.gamma(),
+                'Vega_Heston': option.vega() / 100.0,
+                'Theta_Heston': option.theta() / 365.25
+            })
+        except Exception as e:
+            print(f"QuantLib Error for {row.name} (Ticker: {underlying_ticker}): {e}")
+            return pd.Series(dtype='float64')
+
+    heston_greeks_df = risk_monitor.apply(calculate_heston_greeks, axis=1)
+    risk_monitor = pd.concat([risk_monitor, heston_greeks_df], axis=1)
+
+    # --- 11. Final Output ---
+    print("\n--- Risk Monitor with Greeks ---")
+
+    final_columns = [
+        'S_Ticker', 'Type', 'S', 'Strike Px', 'Maturity', 'Opt_Bid', 'Opt_Ask', 'Opt_Last', 'IV',
+        'Delta', 'Gamma', 'Vega', 'Theta', 'Rho',
+        'Delta_Heston', 'Gamma_Heston', 'Vega_Heston', 'Theta_Heston',
+        'Intrinsic_Value'
+    ]
+
+    # Filter columns that actually exist (in case Heston failed completely)
+    final_columns_exist = [col for col in final_columns if col in risk_monitor.columns]
+
+    risk_monitor_final = risk_monitor[final_columns_exist].round(4)
+    print(risk_monitor_final.to_string())
+
+    # Save to Excel
+    filepath = "Risk_Monitor_Final.xlsx"
+    risk_monitor_final.to_excel(filepath, index=False)
+    print(f"\nExcel file '{filepath}' generated successfully.")
+
+    # Stop the Bloomberg connection
+    con.stop()
+    print("\nScript completed. Bloomberg connection closed.")
+
+    return risk_monitor_final, filepath
+
+
+# --- 4. DASH APPLICATION ---
+app = dash.Dash(__name__)
+
+app.layout = html.Div([
+    html.H1("Financial Risk Monitor"),
+    html.Div([
+        html.Button('🚀 Generate Monitor', id='btn-generate', n_clicks=0),
+        html.Button('✉️ Send via Email', id='btn-send', n_clicks=0, disabled=True),
+        dcc.Input(id='input-email', type='email', placeholder='Enter email...', style={'marginLeft': '10px'})
+    ]),
+    html.Hr(),
+    html.H3("Status:"),
+    dcc.Loading(
+        id="loading-spinner",
+        type="default",
+        children=html.Div(id='log-output', style={
+            'fontFamily': 'Courier New', 'whiteSpace': 'pre-wrap',
+            'border': '1px solid black', 'padding': '5px',
+            'minHeight': '100px', 'backgroundColor': '#f9f9f9'
+        })
+    ),
+    html.Hr(),
+    html.H3("Monitor Preview:"),
+    dash_table.DataTable(
+        id='table-output',
+        columns=[],
+        data=[],
+        style_table={'overflowX': 'auto'},
+        page_size=15,
+        filter_action="native",
+        sort_action="native",
+        sort_mode="multi",
+    ),
+    dcc.Store(id='store-filepath', data=None)
+])
+
+
+@app.callback(
+    Output('log-output', 'children'),
+    Output('table-output', 'data'),
+    Output('table-output', 'columns'),
+    Output('store-filepath', 'data'),
+    Output('btn-send', 'disabled'),
+    Input('btn-generate', 'n_clicks')
+)
+def update_monitor(n_clicks):
+    if n_clicks == 0:
+        return "Please click 'Generate' to start.", [], [], None, True
+
+    try:
+        df, filepath = run_risk_monitor()
+
+        if df is None:
+            return "ERROR: Generation failed. Check console.", [], [], None, True
+
+        data = df.to_dict('records')
+        columns = [{"name": i, "id": i} for i in df.columns]
+
+        return f"Generation successful.\nFile saved: {filepath}", data, columns, filepath, False
+
+    except Exception as e:
+        return f"UNEXPECTED ERROR: {e}", [], [], None, True
+
+
+@app.callback(
+    Output('log-output', 'children', allow_duplicate=True),
+    Input('btn-send', 'n_clicks'),
+    State('input-email', 'value'),
+    State('store-filepath', 'data'),
+    State('log-output', 'children'),
+    prevent_initial_call=True
+)
+def send_email_callback(n_clicks, to_email, filepath, current_logs):
+    if not to_email:
+        return current_logs + "\n\nERROR: Please enter an email address."
+    if not filepath:
+        return current_logs + "\n\nERROR: Please generate a file first."
+
+    try:
+        subject = f"Risk Monitor - {datetime.date.today()}"
+        body = "Please find the risk monitor attached."
+        send_email(to_email, subject, body, filepath)
+        return current_logs + f"\n\nSUCCESS: Email sent to {to_email}."
+    except Exception as e:
+        return current_logs + f"\n\nEMAIL ERROR: {e}."
+
+
+# --- 5. START SERVER ---
+if __name__ == '__main__':
+    print("Starting Dash server... Open http://127.0.0.1:8050/ in your browser.")
+    app.run(debug=True)
