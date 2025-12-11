@@ -20,7 +20,7 @@ from email.mime.text import MIMEText
 
 # --- 2. EMAIL SENDING FUNCTION ---
 # (Configure your SMTP settings here)
-SMTP_SERVER = 'smtp.yourserver.com'  # e.g., 'smtp.gmail.com'
+SMTP_SERVER = 'smtp.gmail.com'  
 SMTP_PORT = 587
 SENDER_EMAIL = 'your_email@gmail.com'  # Replace with your email
 SENDER_PASSWORD = 'your_password'  # Replace with your app password
