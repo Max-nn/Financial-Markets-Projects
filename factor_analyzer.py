@@ -18,7 +18,7 @@ data_df = data_df.rename(columns={'Mkt-RF': 'Mkt_RF'})
 
 # Step 3 - Importing Security Data
 
-ticker = "ARKK"
+ticker = input('Enter Yahoo Finance ticker:',)
 df_asset = yf.download(ticker, start=start, end=end, interval="1mo")
 # We only keep close
 prices = df_asset['Close']
