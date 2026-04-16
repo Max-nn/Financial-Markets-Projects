@@ -1,0 +1,101 @@
+import numpy as np
+import pandas as pd
+import yfinance as yf
+from scipy import stats
+from scipy.stats import norm, multivariate_normal
+import matplotlib.pyplot as plt
+
+
+def run_futures_analysis():
+    print("--- Project Milestone - Part 3: Futures Copula Analysis ---")
+
+    # 1. Data Selection & Fetching
+    # HG=F is COMEX Copper, TIO=F is Iron Ore (62% Fe, CFR China)
+    tickers = ["HG=F", "TIO=F"]
+    names = ["Copper", "Iron Ore"]
+
+    print(f"Fetching data for {', '.join(names)}...")
+
+    # Fetching 3 years of weekly data
+    # Note: Weekly data usually uses Friday closes
+    data = yf.download(tickers, period="3y", interval="1wk")['Close'].dropna()
+
+    # Calculate Weekly Percentage/Log Changes
+    # We use log returns for better statistical properties in copula modeling
+    returns = np.log(data / data.shift(1)).dropna()
+
+    # 2. Establish Empirical Cumulative Distribution (ECDF)
+    # The probability transformation u = F(x)
+    u_data = pd.DataFrame(index=returns.index)
+
+    for col in returns.columns:
+        # Sort data to compute empirical rank-based probabilities
+        # We use (rank) / (n + 1) to avoid 0 or 1 which break the Gaussian inverse
+        u_data[col] = returns[col].rank() / (len(returns) + 1)
+
+    print("Empirical CDF transformation completed.")
+
+    # 3. Probability Transformation (To Gaussian Space)
+    # Transform Uniform random variables to Standard Normal
+    z_data = norm.ppf(u_data)
+
+    # 4. Gaussian Copula - Correlation Matrix
+    # The Gaussian Copula is defined by the correlation matrix of the transformed normals
+    rho = np.corrcoef(z_data, rowvar=False)
+    print(f"\nEstimated Correlation Matrix (Gaussian Copula):\n{rho}")
+
+    # 5. Generate 95% Coverage Bounds for Next Week
+    # We simulate from the joint distribution to find the bounds
+    n_simulations = 100000
+    mean = [0, 0]
+    # Generate bivariate normal samples
+    z_sim = multivariate_normal.rvs(mean=mean, cov=rho, size=n_simulations)
+
+    # Transform back: Z -> Uniform -> Empirical Quantiles
+    u_sim = norm.cdf(z_sim)
+
+    # Calculate bounds for each future
+    bounds = {}
+    last_prices = data.iloc[-1]
+
+    plt.figure(figsize=(12, 6))
+
+    for i, col in enumerate(returns.columns):
+        # Map simulated uniform values back to the original returns distribution
+        # using the empirical quantiles of the historical data
+        sim_returns = np.percentile(returns[col], u_sim[:, i] * 100)
+
+        # Calculate price bounds: Price_next = Price_now * exp(return)
+        sim_prices = last_prices[col] * np.exp(sim_returns)
+
+        lower_bound = np.percentile(sim_prices, 2.5)
+        upper_bound = np.percentile(sim_prices, 97.5)
+
+        bounds[names[i]] = (lower_bound, upper_bound)
+
+        # Plotting
+        plt.subplot(1, 2, i + 1)
+        plt.hist(sim_prices, bins=50, alpha=0.6, color='skyblue', edgecolor='black', density=True)
+        plt.axvline(last_prices[col], color='red', linestyle='--', label=f'Current: {last_prices[col]:.2f}')
+        plt.axvline(lower_bound, color='green', linestyle='-', label=f'LB (95%): {lower_bound:.2f}')
+        plt.axvline(upper_bound, color='green', linestyle='-', label=f'UB (95%): {upper_bound:.2f}')
+        plt.title(f"{names[i]} Next Week Forecast")
+        plt.xlabel("Price")
+        plt.ylabel("Density")
+        plt.legend()
+
+    plt.tight_layout()
+
+    # Output Results
+    print("\n--- 95% Coverage Bounds for Next Week ---")
+    for name in names:
+        lb, ub = bounds[name]
+        print(f"{name}: Lower Bound = {lb:.4f}, Upper Bound = {ub:.4f}")
+
+    print("\nVisualizing results...")
+    plt.show()
+
+
+if __name__ == "__main__":
+    # Ensure dependencies are installed: pip install yfinance scipy pandas matplotlib
+    run_futures_analysis()
